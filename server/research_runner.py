@@ -1,6 +1,7 @@
 """Server-owned research sessions; local launchers only transport and run the CLI."""
 import base64
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ class Start(BaseModel):
     question: str=Field(min_length=1,max_length=16000)
     provider: Literal['codex','claude']
     key: str=Field(pattern=r'^[a-f0-9]{64}$')
+    attempt_token: str | None=Field(default=None,min_length=43,max_length=128,pattern=r'^[A-Za-z0-9_-]+$')
     root: str
     python: str
     cli_paths: dict[str,str]
@@ -53,30 +55,41 @@ class Sessions:
         return row['helper'] if row else 'required'
 
     def start(self,device,data):
-        now=time.time(); sid=str(uuid.uuid4()); task=str(uuid.uuid4()); token=secrets.token_urlsafe(32)
+        now=time.time(); sid=str(uuid.uuid4()); task=str(uuid.uuid4()); token=data.attempt_token or secrets.token_urlsafe(32)
         with self.store.db(True) as db:
             self.store.expire(db)
             d=db.execute('SELECT * FROM devices WHERE id=?',(device,)).fetchone()
             if d['paused']: raise HTTPException(409,'PC paused')
             previous=db.execute('SELECT * FROM tasks WHERE device_id=? AND idempotency_key=?',(device,'runner:'+data.key)).fetchone()
             if previous:
-                session=db.execute('SELECT id FROM research_runner_sessions WHERE task_id=?',(previous['id'],)).fetchone()
+                session=db.execute('SELECT * FROM research_runner_sessions WHERE task_id=?',(previous['id'],)).fetchone()
+                saved=json.loads(session['context'])
+                if any(saved.get(k)!=v for k,v in data.model_dump(exclude={'attempt_token'}).items()):
+                    raise HTTPException(409,'Request ID reused with different content')
+                if previous['attempt_id']!=session['id']:
+                    raise HTTPException(409,'This attempt was replaced; inspect task status')
                 if previous['state'] in ('completed','failed','cancelled'):
                     return dict(id=session['id'],task_id=previous['id'],finished=True,state=previous['state'],result=json.loads(previous['result'] or 'null'),error=previous['error'])
-                raise HTTPException(409,'This request already exists; inspect --status instead of starting a duplicate')
+                if (not data.attempt_token or not hmac.compare_digest(session['token_hash'],hashlib.sha256(token.encode()).hexdigest())
+                    or previous['state']!='running' or previous['cancel_requested'] or session['expires']<=now):
+                    raise HTTPException(409,'Attempt cannot reconnect; inspect task status')
+                return self.settings(session['id'],previous['id'],data.provider,token,session['expires'])
             if db.execute("SELECT 1 FROM tasks WHERE device_id=? AND state IN ('running','blocked','pending') AND deleted=0",(device,)).fetchone(): raise HTTPException(409,'PC already has work; finish or stop it first')
             if db.execute("SELECT 1 FROM tasks WHERE device_id=? AND cancel_requested=1 AND state IN ('running','blocked')",(device,)).fetchone(): raise HTTPException(409,'Previous worker stop is unconfirmed')
-            context=data.model_dump(); context['helper_policy']=self.policy(db,device)
+            context=data.model_dump(exclude={'attempt_token'}); context['helper_policy']=self.policy(db,device)
             # Reserve the ordinary task slot before a newly installed helper can poll.
             db.execute("INSERT INTO tasks(id,device_id,title,prompt,provider,kind,state,created,updated,idempotency_key,attempt_id,worker_id,lease_hash,lease_expires,attempts) VALUES (?,?,?,?,?,'research','running',?,?,?,?,?,?,?,1)",
                 (task,device,data.question[:100],data.question,data.provider,now,now,'runner:'+data.key,sid,'research-runner:'+sid,hashlib.sha256(token.encode()).hexdigest(),now+90))
             db.execute('INSERT INTO research_runner_sessions VALUES (?,?,?,?,?,?,?,?,?)',(sid,device,task,data.provider,hashlib.sha256(token.encode()).hexdigest(),now+21600,json.dumps(context),None,now))
+        return self.settings(sid,task,data.provider,token,now+21600)
+
+    def settings(self,sid,task,provider,token,expires):
         model=os.environ.get('HELPER_BOOTSTRAP_MODEL','abliterated-model-large-flash')
         base=os.environ.get('RESEARCH_RUNNER_BASE_URL','https://ask-gateway.r95426882.workers.dev')
-        return dict(id=sid,task_id=task,model_token=token,model=model,base_url=base+('/api/model' if data.provider=='codex' else '/api/model/anthropic'),research_url=base+'/api/research/mcp',timeout_seconds=21600,model_catalog=json.loads(Path(os.environ['HELPER_BOOTSTRAP_MODELS']).read_text()))
+        return dict(id=sid,task_id=task,model_token=token,model=model,base_url=base+('/api/model' if provider=='codex' else '/api/model/anthropic'),research_url=base+'/api/research/mcp',timeout_seconds=max(0,int(expires-time.time())),model_catalog=json.loads(Path(os.environ['HELPER_BOOTSTRAP_MODELS']).read_text()))
 
     def row(self,db,device,sid):
-        row=db.execute('SELECT r.*,t.state,t.cancel_requested,t.result,t.error,d.paused FROM research_runner_sessions r JOIN tasks t ON t.id=r.task_id JOIN devices d ON d.id=r.device_id WHERE r.id=? AND r.device_id=?',(sid,device)).fetchone()
+        row=db.execute('SELECT r.*,t.state,t.attempt_id AS current_attempt,t.lease_expires,t.cancel_requested,t.result,t.error,d.paused FROM research_runner_sessions r JOIN tasks t ON t.id=r.task_id JOIN devices d ON d.id=r.device_id WHERE r.id=? AND r.device_id=?',(sid,device)).fetchone()
         if row is None: raise HTTPException(404,'Runner session not found')
         return row
 
@@ -88,7 +101,7 @@ class Sessions:
     def pulse(self,device,sid):
         with self.store.db(True) as db:
             r=self.row(db,device,sid)
-            stop=r['state']!='running' or r['cancel_requested'] or r['paused'] or time.time()>r['expires']
+            stop=r['current_attempt']!=sid or r['lease_expires']<time.time() or r['state']!='running' or r['cancel_requested'] or r['paused'] or time.time()>r['expires']
             if not stop:
                 db.execute('UPDATE tasks SET lease_expires=?,updated=? WHERE id=?',(time.time()+90,time.time(),r['task_id']))
                 db.execute("UPDATE devices SET agent_seen=?,agent_status='working' WHERE id=?",(time.time(),device))
@@ -96,7 +109,7 @@ class Sessions:
 
     def authorize(self,token,provider):
         with self.store.db() as db:
-            r=db.execute("SELECT r.* FROM research_runner_sessions r JOIN tasks t ON t.id=r.task_id JOIN devices d ON d.id=r.device_id WHERE r.token_hash=? AND r.provider=? AND r.expires>? AND t.state='running' AND t.lease_expires>? AND t.cancel_requested=0 AND d.paused=0",(hashlib.sha256(token.encode()).hexdigest(),provider,time.time(),time.time())).fetchone()
+            r=db.execute("SELECT r.* FROM research_runner_sessions r JOIN tasks t ON t.id=r.task_id JOIN devices d ON d.id=r.device_id WHERE r.token_hash=? AND r.provider=? AND r.expires>? AND t.attempt_id=r.id AND t.state='running' AND t.lease_expires>? AND t.cancel_requested=0 AND d.paused=0",(hashlib.sha256(token.encode()).hexdigest(),provider,time.time(),time.time())).fetchone()
         if not r:return None
         return dict(scope='research-runner',device_id=r['device_id'],task_id=r['task_id'],attempt_id=r['id'],provider=provider,server_instructions=self.instructions(r))
 
@@ -134,7 +147,14 @@ class Sessions:
     def finish(self,device,sid,data):
         with self.store.db(True) as db:
             r=self.row(db,device,sid)
-            if r['state'] in ('completed','failed','cancelled'): return {'state':r['state'],'task_id':r['task_id']}
+            if r['current_attempt']!=sid: raise HTTPException(409,'Attempt was replaced')
+            context=json.loads(r['context'])
+            completion=hashlib.sha256(json.dumps(data.model_dump(),sort_keys=True,separators=(',',':')).encode()).hexdigest()
+            if r['state'] in ('completed','failed','cancelled'):
+                if context.get('completion_hash')!=completion:
+                    if r['state']=='cancelled': return {'state':'cancelled','task_id':r['task_id']}
+                    raise HTTPException(409,'Completion does not match recorded result')
+                return dict(state=r['state'],task_id=r['task_id'],result=data.result,error=r['error'])
             success=data.exit_code==0 and bool(data.result.strip())
             error=None if success else 'Runner failed: '+data.result[:2000]
             if success and self.policy(db,device)=='required':
@@ -143,7 +163,8 @@ class Sessions:
             state='cancelled' if r['cancel_requested'] else ('completed' if success else 'failed')
             result=json.dumps({'summary':data.result,'report':data.result})
             db.execute('UPDATE tasks SET state=?,result=?,error=?,updated=?,lease_expires=0 WHERE id=?',(state,result,error,time.time(),r['task_id']))
-            db.execute('UPDATE research_runner_sessions SET expires=0 WHERE id=?',(sid,))
+            context['completion_hash']=completion
+            db.execute('UPDATE research_runner_sessions SET expires=0,context=? WHERE id=?',(json.dumps(context),sid))
             db.execute("UPDATE devices SET agent_seen=?,agent_status='idle' WHERE id=?",(time.time(),device))
             return dict(task_id=r['task_id'],state=state,result=data.result,error=error)
 

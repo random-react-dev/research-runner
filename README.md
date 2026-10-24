@@ -19,7 +19,7 @@ python3 /path/to/skills/research/scripts/launch.py "Your research question"
 python3 /path/to/skills/research/scripts/launch.py --status
 ```
 
-Keep the launcher running until it returns. Repeating an identical question returns its existing result or reports that it is still active. Interrupted attempts retain their dashboard record; no silent duplicate retry is started. Use a different question for a new task.
+Keep the launcher running until it returns. Repeating an identical question returns its existing result or reports that it is still active. Temporary connection failures retry for up to 60 seconds using the same saved attempt. Finished reports remain saved locally until the server acknowledges them; rerun the same question to retry delivery. An exited agent is not automatically relaunched, and expired, stopped or replaced attempts are not revived. Use a different question for a new task.
 
 The server manager's `helper-policy` command accepts `helper: required` or `helper: skip`, with an optional `device_id`. The default is `required`. Saved manager rules are supplied on each model request. This control is local to the existing server manager.
 

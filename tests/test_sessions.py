@@ -52,3 +52,33 @@ def test_instruction_injection_uses_current_rules(setup):
         db.execute('CREATE TABLE manager_rules(scope TEXT,instructions TEXT)')
         db.execute('INSERT INTO manager_rules VALUES (?,?)',('global','Use official sources only'))
     assert 'Use official sources only' in r.authorize(start['model_token'],'codex')['server_instructions']
+
+def test_lost_start_response_recovers_same_session(setup):
+    s,r,d,data=setup;data.attempt_token='r'*43
+    first=r.start(d,data);second=r.start(d,data)
+    assert first['id']==second['id'] and first['model_token']==second['model_token']
+    with s.db() as db:assert db.execute('SELECT count(*) FROM tasks').fetchone()[0]==1
+    with pytest.raises(HTTPException):r.start(d,data.model_copy(update={'attempt_token':'s'*43}))
+    with pytest.raises(HTTPException):r.start(d,data.model_copy(update={'question':'Changed goal'}))
+
+def test_old_attempt_cannot_reconnect_pulse_or_finish_retried_task(setup):
+    s,r,d,data=setup;data.attempt_token='r'*43;first=r.start(d,data)
+    with s.db() as db:db.execute("UPDATE tasks SET state='blocked' WHERE id=?",(first['task_id'],))
+    s.retry(first['task_id'],True)
+    with s.db() as db:db.execute("UPDATE tasks SET state='running',attempt_id='new-owner',lease_expires=? WHERE id=?",(time.time()+90,first['task_id']))
+    assert r.authorize(first['model_token'],'codex') is None
+    assert r.pulse(d,first['id'])['stop']
+    with pytest.raises(HTTPException):r.start(d,data)
+    with pytest.raises(HTTPException):r.finish(d,first['id'],Finish(exit_code=0,result='Late result'))
+    with s.db() as db:assert db.execute('SELECT state FROM tasks').fetchone()[0]=='running'
+
+def test_completion_replay_exactly_once(setup):
+    s,r,d,data=setup;first=r.start(d,data);body=Finish(exit_code=0,result='Saved report')
+    assert r.finish(d,first['id'],body)==r.finish(d,first['id'],body)
+    with pytest.raises(HTTPException):r.finish(d,first['id'],Finish(exit_code=0,result='Different report'))
+
+def test_expired_or_cancelled_attempt_not_revived(setup):
+    s,r,d,data=setup;data.attempt_token='r'*43;first=r.start(d,data)
+    with s.db() as db:db.execute('UPDATE tasks SET lease_expires=? WHERE id=?',(time.time()-1,first['task_id']))
+    assert r.pulse(d,first['id'])['stop']
+    with pytest.raises(HTTPException):r.start(d,data)

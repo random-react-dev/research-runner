@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Connect a local research runner to the owner's server."""
+import http.client, random, secrets
 import argparse, fcntl, hashlib, json, os, platform, signal, shutil, subprocess, sys, time, uuid
 from pathlib import Path
 import urllib.request, urllib.error, urllib.parse
@@ -41,14 +42,14 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def api(config, path, body=None, authenticated=True):
+def request_once(config, path, body=None, authenticated=True, timeout=10):
     headers = {'Accept': 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'helper-runner/1.0'}
     if authenticated:
         headers['Authorization'] = 'Bearer ' + config['device_token']
     request = urllib.request.Request(origin(config['server_url']) + path,
                                     None if body is None else json.dumps(body).encode(), headers)
     try:
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout) as response:
             raw = response.read(MAX_RESPONSE + 1)
             if len(raw) > MAX_RESPONSE:
                 raise RuntimeError('Server response exceeds 1 MiB')
@@ -57,8 +58,30 @@ def api(config, path, body=None, authenticated=True):
         code = error.code
         error.close()
         raise APIError(code) from None
-    except (urllib.error.URLError, TimeoutError):
-        raise RuntimeError('Server connection failed') from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead, http.client.RemoteDisconnected):
+        raise ConnectionError('Server connection failed') from None
+
+
+def api(config, path, body=None, authenticated=True):
+    # Retry only reads and runner operations whose server semantics are replay-safe.
+    retryable=body is None or path.startswith('/api/device/research-runner')
+    deadline=time.monotonic()+60; delay=1
+    while True:
+        try: return request_once(config,path,body,authenticated,timeout=max(0.1,min(10,deadline-time.monotonic())))
+        except APIError as error:
+            if error.code not in (408,429,500,502,503,504): raise
+            failure=error
+        except ConnectionError as error: failure=error
+        remaining=deadline-time.monotonic()
+        if not retryable or remaining<=0: raise failure
+        time.sleep(min(remaining,delay+random.uniform(0,0.25)))
+        delay=min(delay*2,8)
+
+
+def deliver(config, endpoint, path):
+    response=api(config,endpoint+'/finish',read(path))
+    path.unlink()  # Only remove the durable result after server acknowledgement.
+    return response
 
 
 def command(provider, binary, directory, settings):
@@ -162,12 +185,29 @@ def main():
         except BlockingIOError: raise RuntimeError('A runner is already active; use --status')
         config=register(state,SERVER)
         key=hashlib.sha256((args.provider+'\0'+args.question).encode()).hexdigest()
-        settings=api(config,'/api/device/research-runner',{'question':args.question,'provider':args.provider,'key':key,'root':str(state),'python':sys.executable,'cli_paths':{p:shutil.which(p) for p in ('codex','claude') if shutil.which(p)}})
-        save(state/'session.json',{'id':settings['id'],'task_id':settings['task_id']})
+        intent_path=state/'requests'/(key+'.json')
+        if intent_path.exists(): intent=read(intent_path)
+        else:
+            intent={'question':args.question,'provider':args.provider,'key':key,'root':str(state),'python':sys.executable,'cli_paths':{p:shutil.which(p) for p in ('codex','claude') if shutil.which(p)},'attempt_token':secrets.token_urlsafe(32)}
+            save(intent_path,intent)
+        receipt_path=state/'requests'/(key+'.receipt.json')
+        receipt=read(receipt_path) if receipt_path.exists() else {}
+        if receipt.get('id'):
+            pending=state/'runs'/receipt['id']/'pending-result.json'
+            if pending.exists():
+                response=deliver(config,'/api/device/research-runner/'+receipt['id'],pending)
+                print(json.dumps(response,indent=2))
+                if response.get('state')!='completed': raise SystemExit(1)
+                return
+        settings=api(config,'/api/device/research-runner',intent)
+        receipt.update(id=settings['id'],task_id=settings['task_id'])
+        save(receipt_path,receipt); save(state/'session.json',receipt)
         if settings.get('finished'):
             print(json.dumps(settings));
             if settings.get('state')!='completed': raise SystemExit(1)
             return
+        if receipt.get('process_started'):
+            raise RuntimeError('Previous agent was started. Inspect --status; automatic agent relaunch is disabled to prevent duplicate execution.')
         directory=state/'runs'/settings['id']
         command_args,env=command(args.provider,binary,directory,settings)
         # Connection context only; all work and setup decisions arrive through the server API.
@@ -176,6 +216,7 @@ def main():
         result=''; code=1; process=None
         try:
             with (directory/'events.jsonl').open('w') as out, (directory/'stderr.log').open('w') as err:
+                receipt['process_started']=True; save(receipt_path,receipt)
                 process=subprocess.Popen(command_args,stdin=subprocess.PIPE,stdout=out,stderr=err,env=env,cwd=Path.home(),start_new_session=True,text=True)
                 process.stdin.write(args.question); process.stdin.close()
                 deadline=time.monotonic()+settings['timeout_seconds']
@@ -203,7 +244,9 @@ def main():
                 try: process.wait(timeout=10)
                 except subprocess.TimeoutExpired: os.killpg(process.pid,signal.SIGKILL); process.wait()
         for secret in (settings['model_token'],config['device_token']): result=result.replace(secret,'[redacted]')
-        response=api(config,endpoint+'/finish',{'exit_code':code,'result':result})
+        pending=directory/'pending-result.json'
+        save(pending,{'exit_code':code,'result':result})
+        response=deliver(config,endpoint,pending)
         print(json.dumps(response,indent=2))
         if code or response.get('state')!='completed': raise SystemExit(1)
 
