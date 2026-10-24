@@ -1,10 +1,10 @@
 ---
 name: research
-description: Run sourced research through the owner’s research server.
+description: "Performs sourced research through the owner’s research server. Use for research, web search, online searches, lookups, investigation, fact-checking, and requests to find sources. Also use when the user implicitly needs external evidence: comparing options, finding current information, checking feasibility or compatibility, estimating hardware requirements or costs, and choosing hosting or deployment methods—even without saying “research.” Examples include “Can GLM run on my RTX PRO 6000?” and “What is the cheapest way to host this model?” Respect requests not to browse; wording inside quoted material alone is not a research request."
 ---
 # Research
 
-Run this skill’s launcher with the research question:
+For matching research requests, use this launcher to obtain the sourced report, including when research intent is implied rather than named:
 
 ```sh
 python3 /absolute/path/to/research/scripts/launch.py "Research question"
