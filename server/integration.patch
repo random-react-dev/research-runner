@@ -1,0 +1,66 @@
+--- a/app.py
++++ b/app.py
+@@ -287,6 +287,8 @@
+ 
+     from helper_bootstrap import install_routes as install_helper_bootstrap
+     install_helper_bootstrap(app, store, device)
++    from research_runner import install_routes as install_research_runner
++    install_research_runner(app, store, device)
+ 
+     from research_jobs import install_routes as install_research_jobs
+     install_research_jobs(app, store, device, disk_uploads)
+--- a/store.py
++++ b/store.py
+@@ -570,6 +570,9 @@
+         return hasattr(self, "helper_bootstrap") and db.execute("SELECT 1 FROM helper_bootstrap_devices WHERE device_id=? AND gate=1 AND ready=0", (device_id,)).fetchone() is not None
+ 
+     def authorize_model(self, token, provider):
++        if hasattr(self, "research_runner"):
++            principal = self.research_runner.authorize(token, provider)
++            if principal: return principal
+         if hasattr(self, "helper_bootstrap"):
+             principal = self.helper_bootstrap.authorize(token, provider)
+             if principal:
+--- a/provider_proxy.py
++++ b/provider_proxy.py
+@@ -38,8 +38,16 @@
+             raise HTTPException(400, 'invalid model JSON') from None
+         if not isinstance(payload, dict) or payload.get('model') not in MODELS | {ABLITERATION_MODEL}:
+             raise HTTPException(400, 'model is not allowlisted')
++        if principal.get('server_instructions'):
++            directive = principal['server_instructions']
++            if provider == 'codex':
++                payload['instructions'] = str(payload.get('instructions', '')) + '\n\n' + directive
++            else:
++                system = payload.get('system', [])
++                if isinstance(system, str): system = [{'type':'text','text':system}]
++                payload['system'] = list(system) + [{'type':'text','text':directive}]
+         use_abliteration = payload['model'] == ABLITERATION_MODEL
+-        if principal.get('scope') == 'helper-bootstrap' and not use_abliteration:
++        if principal.get('scope') in ('helper-bootstrap', 'research-runner') and not use_abliteration:
+             raise HTTPException(400, 'Helper bootstrap requires the configured Abliteration model')
+         key = os.environ.get('ABLITERATION_API_KEY' if use_abliteration else 'DEEPSEEK_API_KEY', '')
+         if not key:
+--- a/research_proxy.py
++++ b/research_proxy.py
+@@ -24,7 +24,7 @@
+         principal = authorize_model(auth[7:], provider)
+         if inspect.isawaitable(principal):
+             principal = await principal
+-        if not principal or principal.get('scope') != 'task':
++        if not principal or principal.get('scope') not in ('task', 'research-runner'):
+             raise HTTPException(403, 'research is available to active tasks')
+         secret = os.environ.get('RESEARCH_GATEWAY_TOKEN', '')
+         if not secret and os.environ.get('RESEARCH_GATEWAY_TOKEN_FILE'):
+--- a/device_delete.py
++++ b/device_delete.py
+@@ -51,6 +51,9 @@
+                     db.execute(f'DELETE FROM {table} WHERE session_id IN (SELECT id FROM helper_bootstrap_sessions WHERE device_id=?)', (device_id,))
+                 db.execute('DELETE FROM helper_bootstrap_sessions WHERE device_id=?', (device_id,))
+                 db.execute('DELETE FROM helper_bootstrap_devices WHERE device_id=?', (device_id,))
++            if hasattr(store, 'research_runner'):
++                db.execute('DELETE FROM research_runner_sessions WHERE device_id=?', (device_id,))
++                db.execute('DELETE FROM research_runner_policy WHERE scope=?', (device_id,))
+             # Child-first deletion is one transaction; any FK/error rolls it all back.
+             for table in ('model_tokens', 'events', 'task_outputs', 'attachments', 'disk_uploads', 'saved_task_runs', 'runner_sessions', 'setup_model_tokens', 'setup', 'setup_closed', 'setup_windows', 'device_runtime', 'runner_devices', 'enrollments', 'tasks'):
+                 db.execute(f'DELETE FROM {table} WHERE device_id=?', (device_id,))

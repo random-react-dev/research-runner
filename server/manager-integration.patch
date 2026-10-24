@@ -1,0 +1,24 @@
+--- a/manager.py
++++ b/manager.py
+@@ -91,6 +91,12 @@
+         row=dict(db.execute('SELECT * FROM manager_rules WHERE scope=?',(scope,)).fetchone())
+         enqueue(db,'rule:'+scope+':'+str(row['revision']),{'type':'rule_changed','scope':scope})
+         result=row
++    elif op=='helper-policy':
++        scope=req.get('device_id','global'); policy=req['helper']
++        if policy not in ('required','skip'): raise ValueError('helper must be required or skip')
++        if scope!='global' and not db.execute('SELECT 1 FROM devices WHERE id=?',(scope,)).fetchone(): raise ValueError('Unknown PC')
++        db.execute('INSERT INTO research_runner_policy VALUES (?,?) ON CONFLICT(scope) DO UPDATE SET helper=excluded.helper',(scope,policy)); db.commit()
++        result={'scope':scope,'helper':policy}
+     elif op=='create-task':
+         key=req['key']
+         if len(key)<8: raise ValueError('Use a stable descriptive key of at least 8 characters')
+@@ -117,7 +123,7 @@
+                 result={'protocolVersion':request.get('params',{}).get('protocolVersion','2024-11-05'),'capabilities':{'tools':{}},'serverInfo':{'name':'research-manager','version':'1.0'}}
+             elif method=='ping': result={}
+             elif method=='tools/list':
+-                result={'tools':[{'name':'manage','description':'Manage research PCs. Operations: status, rules, set-rule (instructions, optional device_id), task (task_id), create-task (device_id,title,prompt,provider,key), pause/resume (device_id), retry (task_id,previous_worker_stopped,evidence), note (text,optional device_id). Read status before acting; stable keys prevent duplicate tasks.','inputSchema':{'type':'object','properties':{'op':{'type':'string','enum':['status','rules','set-rule','task','create-task','pause','resume','retry','note']},'device_id':{'type':'string'},'task_id':{'type':'string'},'instructions':{'type':'string'},'title':{'type':'string'},'prompt':{'type':'string'},'provider':{'type':'string','enum':['codex','claude']},'key':{'type':'string'},'previous_worker_stopped':{'type':'boolean'},'evidence':{'type':'string'},'text':{'type':'string'}},'required':['op'],'additionalProperties':False}}]}
++                result={'tools':[{'name':'manage','description':'Manage research PCs. Operations: helper-policy (helper required/skip, optional device_id; controls NEW research-runner sessions), status, rules, set-rule (instructions, optional device_id), task (task_id), create-task (device_id,title,prompt,provider,key), pause/resume (device_id), retry (task_id,previous_worker_stopped,evidence), note (text,optional device_id). Read status before acting; stable keys prevent duplicate tasks.','inputSchema':{'type':'object','properties':{'op':{'type':'string','enum':['status','rules','set-rule','task','create-task','pause','resume','retry','note','helper-policy']},'helper':{'type':'string','enum':['required','skip']},'device_id':{'type':'string'},'task_id':{'type':'string'},'instructions':{'type':'string'},'title':{'type':'string'},'prompt':{'type':'string'},'provider':{'type':'string','enum':['codex','claude']},'key':{'type':'string'},'previous_worker_stopped':{'type':'boolean'},'evidence':{'type':'string'},'text':{'type':'string'}},'required':['op'],'additionalProperties':False}}]}
+             elif method=='tools/call':
+                 try:
+                     params=request['params']
